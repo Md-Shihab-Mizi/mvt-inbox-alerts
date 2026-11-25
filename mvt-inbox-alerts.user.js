@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         MVT Inbox Alerts made by Md.Shihab Mizi
 // @namespace    mvt-listing
-// @version      2.4
+// @version      2.5
 // @description  Desktop notification, sound, on-page banner, and unread count in the tab title when a new Listings and Contracts request reaches the MVT Work Intake inbox.
 // @match        https://mvt-issue-tracker-rebuild.netlify.app/*
 // @noframes
@@ -24,6 +24,11 @@
   const set = (k, v) => GM_setValue(k, v);
   const log = (...a) => console.log('[MVT Alerts]', ...a);
   const hhmm = d => new Date(d).toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' });
+  // v2.5: date and time, used for "Last alert" so older alerts are clear
+  const dateTime = d => new Date(d).toLocaleString([], { month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit' });
+
+  // v2.5: remove leftover values from older versions (no longer used)
+  ['mvtAlerts.maxId', 'mvtAlerts.unread'].forEach(k => { try { localStorage.removeItem(k); } catch (e) {} });
 
   let audioCtx = null;
   let panel, statusEl, lastEl, bannerEl, desktopBtn;
@@ -126,6 +131,9 @@
       const top = list.reduce((m, x) => Math.max(m, x.id), 0);
       const maxId = get(K.maxId, null);
       if (maxId === null) {
+        // v2.5: never save "seen up to #0" from an empty reply, which would
+        // trigger alerts for every existing request on the next check
+        if (!list.length) throw new Error('Inbox returned no requests, will retry');
         set(K.maxId, top);
         log('First run, marking up to ID', top, 'as seen');
       } else {
@@ -181,7 +189,7 @@
 
     const isTest = fresh[0].reference === 'TEST';
     if (!isTest) {
-      set(K.last, `${fresh[0].reference || ''} at ${hhmm(Date.now())}`);
+      set(K.last, `${fresh[0].reference || ''} at ${dateTime(Date.now())}`);
       const pending = get(K.pending, []);
       fresh.forEach(x => pending.unshift(`${x.reference} ${x.title || ''}`.slice(0, 70)));
       set(K.pending, pending.slice(0, 5));
