@@ -1,58 +1,85 @@
 // ==UserScript==
-// @name         MVT Inbox Alerts made by Md.Shihab Mizi
+// @name         MVT Inbox Alerts (Listing & Contract Team)
 // @namespace    mvt-listing
-// @version      2.5
-// @description  Desktop notification, sound, on-page banner, and unread count in the tab title when a new Listings and Contracts request reaches the MVT Work Intake inbox.
+// @version      3.0.1
+// @description  Desktop notification, sound, on-page banner, and unread count in the tab title when a new Listings and Contracts request reaches the MVT Work Intake inbox. Works for any team member signed in to the MVT Work Intake site.
+// @author       Md. Shihab Mizi
 // @match        https://mvt-issue-tracker-rebuild.netlify.app/*
 // @noframes
 // @grant        GM_notification
 // @grant        GM_getValue
 // @grant        GM_setValue
 // @run-at       document-idle
+// @updateURL    https://raw.githubusercontent.com/Md-Shihab-Mizi/mvt-inbox-alerts/main/mvt-inbox-alerts.user.js
+// @downloadURL  https://raw.githubusercontent.com/Md-Shihab-Mizi/mvt-inbox-alerts/main/mvt-inbox-alerts.user.js
 // ==/UserScript==
+
+/*
+  TEAM INSTALL
+  1. Install the Tampermonkey extension in Chrome or Edge.
+  2. Open the install link shared by the Listing Team and click Install.
+  3. Open the MVT Work Intake site and sign in with your own account.
+  4. In the alert panel (bottom right) click "Turn on desktop alerts", then "Test alert".
+  5. Keep one MVT Work Intake tab open while you work. It can stay in the background.
+
+  Nothing in this script is tied to one person. Each team member's own sign-in
+  is used, and every setting (sound, seen requests, unread count) is saved
+  separately in that person's browser.
+*/
 
 (function () {
   'use strict';
 
+  const VERSION = '3.0.1';
   const POLL_MS = 30000;
-  const TOKEN_KEY = 'sb-ebqjwmspyjzqvxxctyyv-auth-token';
-  const SUPABASE_URL = 'https://ebqjwmspyjzqvxxctyyv.supabase.co';
+  const HEARTBEAT_MS = 10000;
+  const LEADER_STALE_MS = 90000; // a tab that has not checked in for 90s gives up its turn
   const REFRESH_EARLY_SEC = 120; // renew the sign-in token 2 minutes before it expires
   const LIST_URL = '/api/trpc/issues.list?batch=1&input=' + encodeURIComponent('{"0":{"json":{}}}');
-  const K = { maxId: 'mvtMaxId', unread: 'mvtUnread', sound: 'mvtSound', min: 'mvtMin', last: 'mvtLastAlert', pending: 'mvtPending' };
+  const K = {
+    maxId: 'mvtMaxId', unread: 'mvtUnread', sound: 'mvtSound', min: 'mvtMin', last: 'mvtLastAlert',
+    pending: 'mvtPending', user: 'mvtUser', leader: 'mvtLeader', status: 'mvtStatus'
+  };
+  const TAB_ID = Math.random().toString(36).slice(2);
   const get = (k, d) => GM_getValue(k, d);
   const set = (k, v) => GM_setValue(k, v);
   const log = (...a) => console.log('[MVT Alerts]', ...a);
   const hhmm = d => new Date(d).toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' });
-  // v2.5: date and time, used for "Last alert" so older alerts are clear
   const dateTime = d => new Date(d).toLocaleString([], { month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit' });
 
-  // v2.5: remove leftover values from older versions (no longer used)
   ['mvtAlerts.maxId', 'mvtAlerts.unread'].forEach(k => { try { localStorage.removeItem(k); } catch (e) {} });
 
   let audioCtx = null;
-  let panel, statusEl, lastEl, bannerEl, desktopBtn;
+  let testBanner = null, testUntil = 0; // the test banner stays up for 15 seconds
+  let panel, statusEl, lastEl, bannerEl, desktopBtn, hintEl;
 
   function isListings(x) {
     return (x.department || '').toLowerCase() === 'listings and contracts' || x.departmentChoice === 'contracts';
   }
 
   // ---------- sign-in token ----------
-  // The site's token lasts 1 hour. When the tab is in the background the site
-  // stops renewing it, which caused the HTTP 403 errors. The script renews
-  // it itself and saves it back, so the site stays signed in as well.
+  // v3.0: the sign-in storage key and server address are found automatically,
+  // so the script keeps working for everyone even if the site changes them.
   let apiKey = null;
   let refreshing = null;
 
+  function tokenKey() {
+    return Object.keys(localStorage).find(k => /^sb-[a-z0-9]+-auth-token$/.test(k)) || null;
+  }
+
+  function supabaseUrl() {
+    const k = tokenKey();
+    return k ? 'https://' + k.slice(3, -'-auth-token'.length) + '.supabase.co' : null;
+  }
+
   function readSession() {
-    try { return JSON.parse(localStorage.getItem(TOKEN_KEY)); } catch (e) { return null; }
+    const k = tokenKey();
+    if (!k) return null;
+    try { return JSON.parse(localStorage.getItem(k)); } catch (e) { return null; }
   }
 
   const expiresSoon = s => !s || !s.expires_at || (s.expires_at - Date.now() / 1000) < REFRESH_EARLY_SEC;
 
-  // v2.4: the site now splits its code into several files and replaces them on
-  // each update, so the key is searched for in every app file, including the
-  // ones listed in the latest copy of the page.
   async function getApiKey() {
     if (apiKey) return apiKey;
     const files = new Set([...document.scripts].map(s => s.src).filter(s => /\/assets\/[^/]+\.js$/.test(s)));
@@ -72,21 +99,20 @@
 
   async function doRefresh() {
     const cur = readSession();
-    if (!cur || !cur.refresh_token) throw new Error('Signed out. Please log in again');
-    const r = await fetch(SUPABASE_URL + '/auth/v1/token?grant_type=refresh_token', {
+    if (!cur || !cur.refresh_token) throw new Error('Signed out. Please log in to MVT Work Intake');
+    const r = await fetch(supabaseUrl() + '/auth/v1/token?grant_type=refresh_token', {
       method: 'POST',
       headers: { apikey: await getApiKey(), 'Content-Type': 'application/json' },
       body: JSON.stringify({ refresh_token: cur.refresh_token })
     });
     if (!r.ok) {
-      // The site may have renewed the token at the same moment. Use its copy if so.
       const now = readSession();
       if (now && now.access_token !== cur.access_token && !expiresSoon(now)) return now;
       throw new Error('Sign-in renewal failed (HTTP ' + r.status + '). Please reload or log in again');
     }
     const s = await r.json();
     if (!s.expires_at) s.expires_at = Math.floor(Date.now() / 1000) + (s.expires_in || 3600);
-    localStorage.setItem(TOKEN_KEY, JSON.stringify(s));
+    localStorage.setItem(tokenKey(), JSON.stringify(s));
     log('Sign-in token renewed, valid until', hhmm(s.expires_at * 1000));
     return s;
   }
@@ -98,17 +124,29 @@
 
   async function token() {
     const s = readSession();
-    if (!s || !s.access_token) throw new Error('Signed out. Please log in again');
+    if (!s || !s.access_token) throw new Error('Signed out. Please log in to MVT Work Intake');
     return expiresSoon(s) ? (await refreshSession()).access_token : s.access_token;
   }
 
+  // v3.0: if a different person signs in on this browser, start fresh for them
+  // so they are not alerted about requests the previous person already saw.
+  function checkUser() {
+    const s = readSession();
+    const uid = s && s.user && s.user.id;
+    if (!uid) return;
+    const prev = get(K.user, null);
+    if (prev !== uid) {
+      if (prev) log('Different account signed in, starting fresh');
+      set(K.user, uid); set(K.maxId, null); set(K.unread, 0); set(K.pending, []); set(K.last, 'none yet');
+    }
+  }
+
   // ---------- fetch ----------
-  // v2.4: show the site's own error message, and say clearly when the
-  // problem is on the site's server rather than in this script.
   async function errorText(r) {
     let msg = '';
     try { const j = await r.json(); msg = (j[0] && j[0].error && j[0].error.json && j[0].error.json.message) || ''; } catch (e) {}
     if (r.status >= 500) return `Site server error, HTTP ${r.status}${msg ? ': ' + msg.replace(/\.$/, '') : ''}. The inbox page is affected too`;
+    if (r.status === 401 || r.status === 403) return `Your account cannot open the inbox (HTTP ${r.status}). Ask an MVT admin to give you inbox access`;
     return `HTTP ${r.status}${msg ? ': ' + msg.replace(/\.$/, '') : ''}`;
   }
 
@@ -125,14 +163,38 @@
     return data[0].result.data.json;
   }
 
+  // ---------- one tab per browser ----------
+  // v3.0: if a team member has several MVT tabs open, only one of them checks
+  // the inbox and sends alerts, so nobody gets the same alert two or three times.
+  // If that tab is closed, another open tab takes over automatically.
+  function isLeader() {
+    const l = get(K.leader, null);
+    const now = Date.now();
+    if (!l || l.id === TAB_ID || now - l.ts > LEADER_STALE_MS) {
+      set(K.leader, { id: TAB_ID, ts: now });
+      return true;
+    }
+    return false;
+  }
+
+  window.addEventListener('pagehide', () => {
+    const l = get(K.leader, null);
+    if (l && l.id === TAB_ID) set(K.leader, null);
+  });
+
+  function shareStatus(text, isError) {
+    set(K.status, { text, isError });
+    setStatus(text, isError);
+  }
+
   async function poll() {
+    if (!isLeader()) { showSharedStatus(); return; }
     try {
+      checkUser();
       const list = await fetchRequests();
       const top = list.reduce((m, x) => Math.max(m, x.id), 0);
       const maxId = get(K.maxId, null);
       if (maxId === null) {
-        // v2.5: never save "seen up to #0" from an empty reply, which would
-        // trigger alerts for every existing request on the next check
         if (!list.length) throw new Error('Inbox returned no requests, will retry');
         set(K.maxId, top);
         log('First run, marking up to ID', top, 'as seen');
@@ -144,13 +206,18 @@
           alertNew(fresh);
         }
       }
-      setStatus(`Watching. Last check ${hhmm(Date.now())} (seen up to #${get(K.maxId, '?')})`, false);
+      shareStatus(`Watching. Last check ${hhmm(Date.now())} (seen up to #${get(K.maxId, '?')})`, false);
     } catch (e) {
       log('Check failed', e);
-      setStatus(`Check failed at ${hhmm(Date.now())} (${e.message}). Will retry.`, true);
+      shareStatus(`Check failed at ${hhmm(Date.now())} (${e.message}). Will retry.`, true);
     }
     updateTitle();
     renderBanner();
+  }
+
+  function showSharedStatus() {
+    const s = get(K.status, null);
+    setStatus('Another MVT tab is watching. ' + (s ? s.text : ''), !!(s && s.isError));
   }
 
   // ---------- alerts ----------
@@ -166,7 +233,6 @@
   }
 
   function desktopNotify(title, text) {
-    // Prefer the site's own browser notification (reliable, stays on screen until dismissed).
     if ('Notification' in window && Notification.permission === 'granted') {
       try {
         const n = new Notification(title, { body: text, requireInteraction: true, tag: 'mvt-' + Date.now() });
@@ -194,9 +260,10 @@
       fresh.forEach(x => pending.unshift(`${x.reference} ${x.title || ''}`.slice(0, 70)));
       set(K.pending, pending.slice(0, 5));
     }
+    if (isTest) { testBanner = [`TEST ${fresh[0].title}`]; testUntil = Date.now() + 15000; }
     beep();
     updateTitle();
-    renderBanner(isTest ? [`TEST ${fresh[0].title}`] : null);
+    renderBanner();
   }
 
   function beep() {
@@ -232,8 +299,6 @@
     if (document.title !== want) document.title = want;
   }
 
-  // Only "Mark seen" clears the count and banner, so an alert is never wiped
-  // just because the tab happened to be in front when it arrived.
   function markSeen() { set(K.unread, 0); set(K.pending, []); updateTitle(); renderBanner(); }
 
   // ---------- panel ----------
@@ -250,19 +315,29 @@
     return { granted: 'Desktop: on', denied: 'Desktop: blocked', default: 'Turn on desktop alerts' }[Notification.permission];
   }
 
+  // v3.0: setup tip for new team members until desktop alerts are on
+  function hintText() {
+    if (!('Notification' in window)) return '';
+    if (Notification.permission === 'default') return 'Setup: click "Turn on desktop alerts", then "Test alert".';
+    if (Notification.permission === 'denied') return 'Desktop alerts are blocked. Click the lock icon in the address bar, allow Notifications, then reload.';
+    return '';
+  }
+
   function buildPanel() {
     panel = document.createElement('div');
     panel.style.cssText = 'position:fixed;right:16px;bottom:16px;z-index:2147483647;background:#f8fafc;color:#1f2937;border:1px solid #d1d5db;border-radius:10px;box-shadow:0 4px 16px rgba(0,0,0,.15);font:12px system-ui;padding:8px 10px;max-width:280px;';
 
     const head = document.createElement('div');
     head.style.cssText = 'display:flex;justify-content:space-between;gap:12px;align-items:center;font-weight:600;cursor:pointer;';
-    head.innerHTML = '<span>Listings and Contracts alerts</span><span>-</span>';
+    head.innerHTML = `<span>Listings and Contracts alerts <span style="font-weight:400;color:#6b7280">v${VERSION}</span></span><span>-</span>`;
 
     bannerEl = document.createElement('div');
     bannerEl.style.cssText = 'display:none;margin-top:6px;padding:6px 8px;border-radius:6px;background:#b91c1c;color:#fff;font-weight:600;cursor:pointer;white-space:pre-line;';
     bannerEl.addEventListener('click', e => { e.stopPropagation(); openInbox(); });
 
     const body = document.createElement('div');
+    hintEl = document.createElement('div');
+    hintEl.style.cssText = 'display:none;margin-top:6px;padding:6px 8px;border-radius:6px;background:#fef3c7;color:#92400e;';
     statusEl = document.createElement('div');
     statusEl.style.cssText = 'margin-top:4px;color:#4b5563;';
     lastEl = document.createElement('div');
@@ -274,10 +349,11 @@
     desktopBtn = btn(desktopLabel(), async b => {
       if ('Notification' in window && Notification.permission === 'default') await Notification.requestPermission();
       b.textContent = desktopLabel();
+      renderBanner();
     });
 
     body.append(
-      statusEl, lastEl,
+      hintEl, statusEl, lastEl,
       btn('Test alert', () => alertNew([{ reference: 'TEST', title: 'This is a test alert', reporterName: 'MVT Inbox Alerts' }])),
       btn('Mark seen', markSeen),
       soundBtn, desktopBtn
@@ -293,15 +369,17 @@
 
   function renderBanner(extra) {
     if (!bannerEl) return;
-    const items = extra || get(K.pending, []);
+    const items = extra || (Date.now() < testUntil ? testBanner : null) || get(K.pending, []);
     bannerEl.style.display = items.length ? '' : 'none';
     bannerEl.textContent = items.length ? 'NEW: ' + items.join('\nNEW: ') : '';
     panel.style.borderColor = items.length ? '#b91c1c' : '#d1d5db';
     lastEl.textContent = 'Last alert: ' + get(K.last, 'none yet');
     if (desktopBtn) desktopBtn.textContent = desktopLabel();
+    const h = hintText();
+    hintEl.textContent = h;
+    hintEl.style.display = h ? '' : 'none';
   }
 
-  // Failed checks show in red so they are easy to spot.
   function setStatus(t, isError) {
     if (!statusEl) return;
     statusEl.textContent = t;
@@ -313,5 +391,7 @@
   renderBanner();
   poll();
   setInterval(poll, POLL_MS);
-  setInterval(updateTitle, 2000);
+  setInterval(isLeader, HEARTBEAT_MS);
+  // keep every open MVT tab's count and banner in step with the watching tab
+  setInterval(() => { updateTitle(); renderBanner(); }, 2000);
 })();
